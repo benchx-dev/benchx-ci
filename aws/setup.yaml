@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AWS resources for an ephemeral benchx-ci deployment: an S3 bucket (write-once
+  raw/ staging, sccache/, and permanent runs/ Parquet), a 3-AZ public VPC with
+  no inbound access, a least-privilege EC2 instance role, and a GitHub OIDC
+  workflow role.
+
+# Deploy (us-east-2 is a good default for Spot availability and pricing), then
+# copy the outputs into repository variables (each output's description is the
+# variable name):
+#
+#   aws cloudformation deploy --region us-east-2 --stack-name benchx-<project> \
+#     --template-file aws/setup.yaml --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides GitHubRepository=<owner>/<repository>
+#   aws cloudformation describe-stacks --region us-east-2 --stack-name benchx-<project> \
+#     --query 'Stacks[0].Outputs[].[Description,OutputValue]' --output text |
+#     while read -r name value; do gh variable set "$name" --body "$value"; done
+#
+# Deleting the stack retains the S3 bucket.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: The repository whose workflows may assume the workflow role, as owner/name.
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: >-
+      Only workflow runs on this branch may assume the role. Dispatched, scheduled
+      and comment-triggered runs are all runs on the default branch.
+  GitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      The ARN of the account's identity provider for token.actions.githubusercontent.com.
+      An account can have only one; leave empty to create it here.
+  GitHubOidcSubPrefix:
+    Type: String
+    Default: ""
+    Description: >-
+      Override the OIDC sub prefix when the repository uses GitHub's immutable
+      OIDC subject (from `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`,
+      e.g. repo:owner@123/name@456). Empty defaults to repo:<GitHubRepository>.
+  ProjectTag:
+    Type: String
+    Default: ""
+    Description: >-
+      Value of the EC2 `project` tag used to scope launch and termination permissions.
+      Defaults to the CloudFormation stack name (e.g. benchx-arrow).
+  AmiX8664:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: AWS public SSM parameter for the x86_64 Amazon Linux 2023 (kernel 6.1) AMI.
+  AmiAarch64:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64
+    Description: AWS public SSM parameter for the arm64 Amazon Linux 2023 (kernel 6.1) AMI.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
+  HasCustomSubPrefix: !Not [!Equals [!Ref GitHubOidcSubPrefix, ""]]
+  HasProjectTag: !Not [!Equals [!Ref ProjectTag, ""]]
+
+Resources:
+  # ---- the bucket ------------------------------------------------------------
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Old versions are a net against a bad compaction, for a month.
+          - Id: old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          # Raw uploads expire once runs/ Parquet has long been compacted.
+          # Nothing under runs/ ever expires.
+          - Id: raw
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 90
+          - Id: sccache
+            Status: Enabled
+            Prefix: sccache/
+            ExpirationInDays: 30
+
+  # A unit's archive is written once: an upload without If-None-Match is refused,
+  # whoever sends it, so an attempt cannot replace what another recorded. The
+  # second condition leaves the parts of a multipart upload alone, which cannot
+  # carry the header.
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UnitArchivesAreWrittenOnce
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${Bucket.Arn}/raw/*/units/*"
+            Condition:
+              "Null":
+                "s3:if-none-match": "true"
+              Bool:
+                "s3:ObjectCreationOperation": "true"
+
+  # ---- the network: three public subnets (one per AZ for Spot failover), no inbound ----
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.71.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Ref "AWS::StackName"}
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Ref "AWS::StackName"}
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  Subnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.71.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub "${AWS::StackName}-az0"}
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.71.0.64/26
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub "${AWS::StackName}-az1"}
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.71.0.128/26
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub "${AWS::StackName}-az2"}
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  Subnet0Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet0
+      RouteTableId: !Ref RouteTable
+  Subnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+  Subnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: benchmark instances - no inbound, all outbound
+      VpcId: !Ref Vpc
+
+  # ---- the instance's own role -----------------------------------------------
+  # The instance runs the code of the commit it measures. It may add to raw/ and
+  # use the compiler cache; it cannot write the Parquet under runs/ that readers
+  # use, and it cannot delete.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-instance"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub "${Bucket.Arn}/raw/*"
+                  - !Sub "${Bucket.Arn}/sccache/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+  # The runner action attaches an instance profile by name; it has the role's name.
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Ref InstanceRole
+      Roles: [!Ref InstanceRole]
+
+  # ---- the role the workflows assume, through GitHub's OIDC tokens -----------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref GitHubOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !If
+                  - HasCustomSubPrefix
+                  - !Sub "${GitHubOidcSubPrefix}:ref:refs/heads/${GitHubBranch}"
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: instances
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Launch only into these subnets and security group, and only with
+              # the project tag, which is what lets the role terminate it later.
+              - Sid: LaunchHere
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet0}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet1}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${SecurityGroup}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              - Sid: LaunchTagged
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "aws:RequestTag/project": !If [HasProjectTag, !Ref ProjectTag, !Ref "AWS::StackName"]
+              - Sid: TagAtLaunch
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    "ec2:CreateAction": RunInstances
+              - Sid: TerminateOwn
+                Effect: Allow
+                Action: [ec2:TerminateInstances, ec2:GetConsoleOutput]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/project": !If [HasProjectTag, !Ref ProjectTag, !Ref "AWS::StackName"]
+              - Sid: Describe
+                Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeInstanceStatus]
+                Resource: "*"
+              - Sid: GiveTheInstanceItsRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt InstanceRole.Arn
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": ec2.amazonaws.com
+        - PolicyName: bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The scheduler and the publish job read; the compaction writes runs/.
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${Bucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${Bucket.Arn}/runs/*"
+
+# Each output's description is the name of the repository variable it goes into.
+Outputs:
+  Region:
+    Description: AWS_REGION
+    Value: !Ref "AWS::Region"
+  WorkflowRoleArn:
+    Description: AWS_ROLE_ARN
+    Value: !GetAtt WorkflowRole.Arn
+  BucketName:
+    Description: BENCH_BUCKET
+    Value: !Ref Bucket
+  ImageX8664:
+    Description: EC2_AMI_X86_64
+    Value: !Ref AmiX8664
+  ImageAarch64:
+    Description: EC2_AMI_AARCH64
+    Value: !Ref AmiAarch64
+  SubnetIds:
+    Description: EC2_SUBNET_IDS
+    Value: !Sub "${Subnet0},${Subnet1},${Subnet2}"
+  SecurityGroupId:
+    Description: EC2_SECURITY_GROUP_ID
+    Value: !Ref SecurityGroup
+  InstanceRoleName:
+    Description: EC2_INSTANCE_ROLE
+    Value: !Ref InstanceProfile

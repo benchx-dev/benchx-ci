@@ -1,0 +1,234 @@
+# Reusable CI workbench workflow: start an ephemeral EC2 Spot/on-demand runner,
+# run the caller's environment setup, execute benchx-ci's resumable unit loop
+# (scripts/bench-run.sh), terminate the instance, and dispatch the caller's
+# publish.yml to compact raw S3 uploads into Parquet and rebuild the site.
+name: bench
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Upstream commit SHA (or ref) to measure
+        type: string
+        required: true
+      machine:
+        description: Machine name from machines_file
+        type: string
+        required: true
+      suite_filter:
+        description: Regex matched against unit names ("." runs all)
+        type: string
+        default: "."
+      budget_minutes:
+        description: Stop starting new units after this many minutes
+        type: string
+        default: "240"
+      configuration:
+        description: Target provider configuration name (e.g. "cpp"); empty passes bare SHA
+        type: string
+        default: ""
+      machines_file:
+        description: Path to machine catalog JSON in the caller repository
+        type: string
+        default: "machines.json"
+      setup_script:
+        description: Optional setup script in the caller repository (run before bench-run.sh)
+        type: string
+        default: ""
+      run_wrapper:
+        description: Optional wrapper command/script in the caller repository used to invoke bench-run.sh
+        type: string
+        default: ""
+      discover_script:
+        description: Script in the caller repository that lists runnable suites given BUILD_DIR
+        type: string
+        required: true
+      post_run_script:
+        description: Optional script in the caller repository run after bench-run.sh (always)
+        type: string
+        default: ""
+      benchx_spec:
+        description: pip requirement spec for benchx (passed to setup_script via BENCHX_SPEC)
+        type: string
+        default: "benchx[parquet]"
+      project_tag:
+        description: EC2 project tag override (default benchx-<project.name>)
+        type: string
+        default: ""
+      work_dir:
+        description: Working directory on the EC2 instance (default /opt/benchx-<project.name>)
+        type: string
+        default: ""
+      packages:
+        description: JSON array of OS packages installed by ec2-github-runner on AL2023
+        type: string
+        default: '["git", "bzip2", "jq", "tar", "libicu"]'
+      publish_workflow:
+        description: Caller workflow filename to dispatch after measurement (empty to skip)
+        type: string
+        default: "publish.yml"
+      ci_repo:
+        description: Repository containing benchx-ci scripts
+        type: string
+        default: "benchx-dev/benchx-ci"
+      ci_ref:
+        description: Git ref of benchx-ci to check out
+        type: string
+        default: "main"
+    secrets:
+      GH_RUNNER_TOKEN:
+        description: Token with permission to register self-hosted runners in the caller repository
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      instance: ${{ steps.runner.outputs.ec2-instance-id }}
+      arch: ${{ steps.machine.outputs.arch }}
+      timeout: ${{ steps.machine.outputs.timeout }}
+      work_dir: ${{ steps.machine.outputs.work_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: machine
+        env:
+          MACHINE: ${{ inputs.machine }}
+          MACHINES_FILE: ${{ inputs.machines_file }}
+          AMI_X86_64: ${{ vars.EC2_AMI_X86_64 }}
+          AMI_AARCH64: ${{ vars.EC2_AMI_AARCH64 }}
+          SUBNETS: ${{ vars.EC2_SUBNET_IDS || vars.EC2_SUBNET_ID }}
+          SG: ${{ vars.EC2_SECURITY_GROUP_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+          BUDGET: ${{ inputs.budget_minutes }}
+          PROJECT_TAG_IN: ${{ inputs.project_tag }}
+          WORK_DIR_IN: ${{ inputs.work_dir }}
+        run: |
+          [[ $BUDGET =~ ^[0-9]+$ ]] || { echo "budget_minutes must be a number"; exit 1; }
+          proj=$(jq -r .name project.json)
+          project_tag=${PROJECT_TAG_IN:-benchx-$proj}
+          work_dir=${WORK_DIR_IN:-/opt/benchx-$proj}
+          jq -e --arg m "$MACHINE" '.[$m]' "$MACHINES_FILE" >/dev/null || { echo "unknown machine $MACHINE"; exit 1; }
+          arch=$(jq -r --arg m "$MACHINE" '.[$m].arch' "$MACHINES_FILE")
+          ami=$AMI_X86_64; [[ $arch == aarch64 ]] && ami=$AMI_AARCH64
+          az_config=$(jq -nc --arg ami "$ami" --arg sg "$SG" --arg region "$REGION" --arg subnets "$SUBNETS" \
+            '[$subnets | split(",")[] | select(length > 0) | {imageId: $ami, subnetId: ., securityGroupId: $sg, region: $region}]')
+          tags=$(jq -nc --arg tag "$project_tag" --arg m "$MACHINE" \
+            '[{"Key": "Name", "Value": ($tag + " " + $m)}, {"Key": "project", "Value": $tag}]')
+          {
+            echo "arch=$arch"
+            echo "timeout=$((BUDGET + 90))"
+            echo "az_config=$az_config"
+            echo "tags=$tags"
+            echo "work_dir=$work_dir"
+            echo "type=$(jq -r --arg m "$MACHINE" '.[$m].instance_type' "$MACHINES_FILE")"
+            echo "volume=$(jq -r --arg m "$MACHINE" '.[$m].volume_gb' "$MACHINES_FILE")"
+            echo "market=$(jq -r --arg m "$MACHINE" '.[$m].market // ""' "$MACHINES_FILE")"
+          } >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: runner
+        uses: machulav/ec2-github-runner@v2.6.1
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_RUNNER_TOKEN }}
+          availability-zones-config: ${{ steps.machine.outputs.az_config }}
+          ec2-instance-type: ${{ steps.machine.outputs.type }}
+          market-type: ${{ steps.machine.outputs.market }}
+          ec2-volume-size: ${{ steps.machine.outputs.volume }}
+          ec2-device-name: /dev/xvda
+          iam-role-name: ${{ vars.EC2_INSTANCE_ROLE }}
+          packages: ${{ inputs.packages }}
+          aws-resource-tags: ${{ steps.machine.outputs.tags }}
+          # Assign a stable logical machine hostname so runs of one machine type
+          # share one benchx series; self-terminate as a net under the stop job.
+          pre-runner-script: |
+            hostnamectl set-hostname "${{ inputs.machine }}"
+            echo "127.0.0.1 ${{ inputs.machine }}" >> /etc/hosts
+            shutdown -h +$(( ${{ inputs.budget_minutes }} + 120 ))
+
+  bench:
+    needs: start
+    runs-on: ${{ needs.start.outputs.label }}
+    timeout-minutes: ${{ fromJSON(needs.start.outputs.timeout) }}
+    env:
+      HOME: /root
+      BENCHX_WORK: ${{ needs.start.outputs.work_dir }}
+      BENCHX_SETUP_FILE: ${{ needs.start.outputs.work_dir }}/setup.json
+      BENCHX_SPEC: ${{ inputs.benchx_spec }}
+      SHA: ${{ inputs.sha }}
+      MACHINE: ${{ inputs.machine }}
+      SUITE_FILTER: ${{ inputs.suite_filter }}
+      BUDGET_MIN: ${{ inputs.budget_minutes }}
+      CONFIGURATION: ${{ inputs.configuration }}
+      DISCOVER_SCRIPT: ${{ inputs.discover_script }}
+      ATTEMPT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      RAW_URL: s3://${{ vars.BENCH_BUCKET }}/raw
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      SCCACHE_BUCKET: ${{ vars.BENCH_BUCKET }}
+      SCCACHE_REGION: ${{ vars.AWS_REGION }}
+      SCCACHE_S3_KEY_PREFIX: sccache/${{ needs.start.outputs.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ci_repo }}
+          ref: ${{ inputs.ci_ref }}
+          path: .benchx-ci
+      - name: set up build environment
+        if: inputs.setup_script != ''
+        env:
+          SETUP_SCRIPT: ${{ inputs.setup_script }}
+        run: "$SETUP_SCRIPT"
+      - name: build and measure
+        env:
+          RUN_WRAPPER: ${{ inputs.run_wrapper }}
+        run: |
+          if [[ -n $RUN_WRAPPER ]]; then
+            "$RUN_WRAPPER" .benchx-ci/scripts/bench-run.sh
+          else
+            .benchx-ci/scripts/bench-run.sh
+          fi
+      - name: post-run hook
+        if: always() && inputs.post_run_script != ''
+        env:
+          POST_RUN_SCRIPT: ${{ inputs.post_run_script }}
+          RUN_WRAPPER: ${{ inputs.run_wrapper }}
+        run: |
+          if [[ -n $RUN_WRAPPER ]]; then
+            "$RUN_WRAPPER" "$POST_RUN_SCRIPT" || true
+          else
+            "$POST_RUN_SCRIPT" || true
+          fi
+
+  stop:
+    needs: [start, bench]
+    if: always() && needs.start.outputs.instance != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: machulav/ec2-github-runner@v2.6.1
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_RUNNER_TOKEN }}
+          label: ${{ needs.start.outputs.label }}
+          ec2-instance-id: ${{ needs.start.outputs.instance }}
+
+  publish:
+    needs: [start, bench, stop]
+    if: always() && needs.start.outputs.instance != '' && inputs.publish_workflow != ''
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_WORKFLOW: ${{ inputs.publish_workflow }}
+        run: gh workflow run "$PUBLISH_WORKFLOW" --repo "$GITHUB_REPOSITORY"

@@ -1,0 +1,103 @@
+# Reusable publish workflow: compact S3 raw uploads into Parquet (runs/), build
+# the static dashboard with `bx view`, and deploy to GitHub Pages when the
+# caller repository variable PAGES_ENABLED is "true".
+name: publish
+on:
+  workflow_call:
+    inputs:
+      benchx_spec:
+        description: pip requirement spec for benchx (must include Parquet + views support)
+        type: string
+        default: "benchx[parquet]"
+      compact_days:
+        description: Look at raw uploads from the last N days (0 compacts all)
+        type: string
+        default: "3"
+      python_version:
+        description: Python version used for compaction and `bx view`
+        type: string
+        default: "3.12"
+      ci_repo:
+        description: Repository containing benchx-ci scripts
+        type: string
+        default: "benchx-dev/benchx-ci"
+      ci_ref:
+        description: Git ref of benchx-ci to check out
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ci_repo }}
+          ref: ${{ inputs.ci_ref }}
+          path: .benchx-ci
+      - id: project
+        run: echo "name=$(jq -r .name project.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+      - name: install benchx and remote dependencies
+        env:
+          BENCHX_SPEC: ${{ inputs.benchx_spec }}
+        run: pip install -q "$BENCHX_SPEC" -r .benchx-ci/requirements.txt
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: vars.BENCH_BUCKET != ''
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: compact raw uploads into Parquet
+        if: vars.BENCH_BUCKET != ''
+        env:
+          COMPACT_DAYS: ${{ inputs.compact_days }}
+        run: python .benchx-ci/scripts/compact.py --raw-url "s3://${{ vars.BENCH_BUCKET }}/raw" --runs-url "s3://${{ vars.BENCH_BUCKET }}/runs" --days "$COMPACT_DAYS" >> "$GITHUB_STEP_SUMMARY"
+      - name: fetch compacted runs
+        if: vars.BENCH_BUCKET != ''
+        run: |
+          mkdir -p runs
+          aws s3 sync --only-show-errors "s3://${{ vars.BENCH_BUCKET }}/runs" runs --exclude '*' --include '*/run.parquet' --include '*/results.parquet'
+      - name: build static dashboard with bx view
+        run: |
+          mkdir -p runs
+          bx view --runs runs --project-file project.json --out site --marts --stamp "${{ github.sha }}"
+      - name: summary
+        run: |
+          {
+            echo "## ${{ steps.project.outputs.name }} benchmarks"
+            echo
+            echo "commits measured: $(find runs -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+            echo
+            echo '```json'
+            cat site/data/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site
+      - uses: actions/configure-pages@v5
+        if: vars.PAGES_ENABLED == 'true'
+      - uses: actions/upload-pages-artifact@v3
+        if: vars.PAGES_ENABLED == 'true'
+        with:
+          path: site
+
+  deploy:
+    needs: publish
+    if: vars.PAGES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

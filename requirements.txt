@@ -1,0 +1,2 @@
+# Remote object storage support (scripts/remote.py with s3:// URLs).
+boto3>=1.36

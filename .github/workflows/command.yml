@@ -1,0 +1,50 @@
+# Reusable comment-command workflow: parse `@github-actions bench <commit> ...`
+# on issues/PRs and dispatch the caller's bench.yml.
+name: command
+on:
+  workflow_call:
+    inputs:
+      comment_body:
+        description: Full body of the triggering comment
+        type: string
+        required: true
+      issue_number:
+        description: Issue or pull request number to reply on
+        type: string
+        required: true
+      machines_file:
+        description: Path to machine catalog JSON in the caller repository
+        type: string
+        default: "machines.json"
+      ci_repo:
+        description: Repository containing benchx-ci scripts
+        type: string
+        default: "benchx-dev/benchx-ci"
+      ci_ref:
+        description: Git ref of benchx-ci to check out
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  command:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ci_repo }}
+          ref: ${{ inputs.ci_ref }}
+          path: .benchx-ci
+      - name: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ inputs.comment_body }}
+          ISSUE: ${{ inputs.issue_number }}
+          MACHINES_FILE: ${{ inputs.machines_file }}
+        run: python3 .benchx-ci/scripts/command.py --root . --machines "$MACHINES_FILE" --repo "$GITHUB_REPOSITORY" --issue "$ISSUE"

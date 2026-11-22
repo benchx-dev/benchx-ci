@@ -1,0 +1,93 @@
+# Reusable schedule workflow: inspect S3 raw/ status for recent upstream commits,
+# dispatch the caller's bench.yml for unmeasured/incomplete pairs, and terminate
+# any orphaned EC2 instances older than orphan_hours.
+name: schedule
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: Only print what would be dispatched
+        type: boolean
+        default: false
+      machines_file:
+        description: Path to machine catalog JSON in the caller repository
+        type: string
+        default: "machines.json"
+      project_tag:
+        description: EC2 project tag override (default benchx-<project.name>)
+        type: string
+        default: ""
+      lookback:
+        description: Number of recent upstream commits to consider
+        type: string
+        default: "10"
+      max_attempts:
+        description: Maximum attempts per (commit, machine)
+        type: string
+        default: "2"
+      max_parallel:
+        description: Maximum concurrent bench runs
+        type: string
+        default: "4"
+      orphan_hours:
+        description: Terminate running/stopped tagged instances older than this many hours
+        type: string
+        default: "8"
+      ci_repo:
+        description: Repository containing benchx-ci scripts
+        type: string
+        default: "benchx-dev/benchx-ci"
+      ci_ref:
+        description: Git ref of benchx-ci to check out
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+jobs:
+  schedule:
+    if: github.event_name == 'workflow_dispatch' || vars.SCHEDULE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ci_repo }}
+          ref: ${{ inputs.ci_ref }}
+          path: .benchx-ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: pip install -q -r .benchx-ci/requirements.txt
+      - name: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_URL: s3://${{ vars.BENCH_BUCKET }}/raw
+          MACHINES_FILE: ${{ inputs.machines_file }}
+          LOOKBACK: ${{ inputs.lookback }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: >-
+          python .benchx-ci/scripts/schedule.py
+          --root . --machines "$MACHINES_FILE"
+          --raw-url "$RAW_URL" --repo "$GITHUB_REPOSITORY"
+          --lookback "$LOOKBACK" --max-attempts "$MAX_ATTEMPTS" --max-parallel "$MAX_PARALLEL"
+          $DRY_RUN >> "$GITHUB_STEP_SUMMARY"
+      - name: terminate orphaned instances
+        if: always()
+        env:
+          PROJECT_TAG_IN: ${{ inputs.project_tag }}
+          ORPHAN_HOURS: ${{ inputs.orphan_hours }}
+        run: |
+          proj=$(jq -r .name project.json)
+          tag=${PROJECT_TAG_IN:-benchx-$proj}
+          cutoff=$(date -u -d "$ORPHAN_HOURS hours ago" +%FT%TZ)
+          ids=$(aws ec2 describe-instances \
+            --filters "Name=tag:project,Values=$tag" Name=instance-state-name,Values=running,stopped \
+            --query "Reservations[].Instances[?LaunchTime<'$cutoff'].InstanceId" --output text)
+          if [[ -n $ids ]]; then echo "terminating: $ids"; aws ec2 terminate-instances --instance-ids $ids >/dev/null; fi
