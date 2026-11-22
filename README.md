@@ -11,7 +11,7 @@ Reusable GitHub Actions + AWS EC2/S3 CI workbench for [benchx](https://github.co
 
 ## Using `benchx-ci` in a project repository
 
-A project benchmark repository (such as [`benchx-arrow`](https://github.com/rok/benchx-arrow)) only needs:
+A project benchmark repository (such as [`benchx-dev/arrow`](https://github.com/benchx-dev/arrow)) only needs:
 
 1. **`project.json`** — project name, title, upstream repo/branch/commit URL, and optional `skip_commit_tags`.
 2. **`benchx.conf.json`** — your target provider command and harness adapter.
