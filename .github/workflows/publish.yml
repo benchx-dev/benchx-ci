@@ -13,6 +13,10 @@ on:
         description: Look at raw uploads from the last N days (0 compacts all)
         type: string
         default: "3"
+      views_format:
+        description: View payload format passed to `bx view --views-format` (json or parquet)
+        type: string
+        default: "json"
       python_version:
         description: Python version used for compaction and `bx view`
         type: string
@@ -64,11 +68,17 @@ jobs:
         if: vars.BENCH_BUCKET != ''
         run: |
           mkdir -p runs
-          aws s3 sync --only-show-errors "s3://${{ vars.BENCH_BUCKET }}/runs" runs --exclude '*' --include '*/run.parquet' --include '*/results.parquet'
+          aws s3 sync --only-show-errors "s3://${{ vars.BENCH_BUCKET }}/runs" runs --exclude '*' --include '*/run.parquet' --include '*/results.parquet' --include 'runs.parquet' --include 'results/*.parquet'
       - name: build static dashboard with bx view
+        env:
+          VIEWS_FORMAT: ${{ inputs.views_format }}
         run: |
           mkdir -p runs
-          bx view --runs runs --project-file project.json --out site --marts --stamp "${{ github.sha }}"
+          args=(--runs runs --project-file project.json --out site --marts --stamp "${{ github.sha }}")
+          if [ "$VIEWS_FORMAT" != "json" ]; then
+            args+=(--views-format "$VIEWS_FORMAT")
+          fi
+          bx view "${args[@]}"
       - name: summary
         run: |
           {
