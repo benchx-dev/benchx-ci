@@ -17,6 +17,10 @@ on:
         description: View payload format passed to `bx view --views-format` (json or parquet)
         type: string
         default: "json"
+      marts:
+        description: Emit derived Parquet marts under site/data/ (--marts vs --no-marts)
+        type: boolean
+        default: true
       python_version:
         description: Python version used for compaction and `bx view`
         type: string
@@ -72,9 +76,15 @@ jobs:
       - name: build static dashboard with bx view
         env:
           VIEWS_FORMAT: ${{ inputs.views_format }}
+          EMIT_MARTS: ${{ inputs.marts }}
         run: |
           mkdir -p runs
-          args=(--runs runs --project-file project.json --out site --marts --stamp "${{ github.sha }}")
+          args=(--runs runs --project-file project.json --out site --stamp "${{ github.sha }}")
+          if [ "$EMIT_MARTS" = "true" ]; then
+            args+=(--marts)
+          else
+            args+=(--no-marts)
+          fi
           if [ "$VIEWS_FORMAT" != "json" ]; then
             args+=(--views-format "$VIEWS_FORMAT")
           fi
